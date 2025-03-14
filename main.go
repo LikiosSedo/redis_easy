@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+    "sort"
 )
 
 // 定义数据类型
@@ -42,14 +43,18 @@ func (e *Entry) isExpired() bool {
 
 // 全局缓存，key 为 string，对应的值为 *Entry
 var cache sync.Map
+var leaderboard sync.Map
 
 func main() {
 	// 如果传入 "stress" 参数则启动压力测试
 	if len(os.Args) > 1 && os.Args[1] == "stress" {
-		runStressTest()
+		runAdvancedStressTest()
 		return
 	}
-
+    if len(os.Args) > 1 && os.Args[1] == "leaderboard" {
+        runLeaderboardTest()
+        return
+    }
 	// 启动 pprof 服务，方便使用 Go 内置工具进行性能分析
 	go func() {
 		log.Println("pprof server listening on :6060")
@@ -119,6 +124,10 @@ func handleConnection(conn net.Conn) {
 			handleHGet(conn, request)
 		case "QUIT":
 			conn.Write([]byte("+OK\r\n"))
+        case "LBADD":
+            handleLBAdd(conn, request)
+        case "LBTOP":
+            handleLBTop(conn, request)
 			return
 		default:
 			conn.Write([]byte(fmt.Sprintf("-ERR unknown command '%s'\r\n", request[0])))
@@ -541,14 +550,82 @@ func handleHGet(conn net.Conn, args []string) {
 	conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(value), value)))
 }
 
+func handleLBAdd(conn net.Conn, args []string) {
+    if len(args) != 3 {
+        conn.Write([]byte("-ERR wrong number of arguments for 'LBADD' command\r\n"))
+        return
+    }
+    user := args[1]
+    scoreStr := args[2]
+    score, err := strconv.Atoi(scoreStr)
+    if err != nil {
+        conn.Write([]byte("-ERR score must be an integer\r\n"))
+        return
+    }
+
+    // 更新或插入用户分数
+    leaderboard.Store(user, score)
+    conn.Write([]byte("+OK\r\n"))
+}
+
+func handleLBTop(conn net.Conn, args []string) {
+    if len(args) != 2 {
+        conn.Write([]byte("-ERR wrong number of arguments for 'LBTOP' command\r\n"))
+        return
+    }
+    topN, err := strconv.Atoi(args[1])
+    if err != nil || topN <= 0 {
+        conn.Write([]byte("-ERR N must be a positive integer\r\n"))
+        return
+    }
+
+    // 收集所有 (user, score)
+    var data []struct {
+        User  string
+        Score int
+    }
+    leaderboard.Range(func(key, value interface{}) bool {
+        user := key.(string)
+        score := value.(int)
+        data = append(data, struct {
+            User  string
+            Score int
+        }{user, score})
+        return true
+    })
+
+    // 按 score 降序排序
+    sort.Slice(data, func(i, j int) bool {
+        return data[i].Score > data[j].Score
+    })
+
+    // 构造 RESP 返回
+    if topN > len(data) {
+        topN = len(data)
+    }
+    // 返回形式：*<N*2>\r\n (因为要返回用户名和分数两个字段)
+    // 再用 bulk string 方式输出
+    var sb strings.Builder
+    sb.WriteString(fmt.Sprintf("*%d\r\n", topN*2))
+    for i := 0; i < topN; i++ {
+        user := data[i].User
+        scoreStr := strconv.Itoa(data[i].Score)
+        sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(user), user))
+        sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(scoreStr), scoreStr))
+    }
+    conn.Write([]byte(sb.String()))
+}
+
 // ======================
 // 简单的压力测试代码
 // ======================
 
 // runStressTest 模拟多个客户端并发发送 SET/GET 命令
-func runStressTest() {
-	const clientCount = 100
-	const opsPerClient = 1000
+// runAdvancedStressTest 模拟缓存服务场景下的高并发读写：80% 请求热点数据、20% 请求随机数据。
+// 此测试分为两个阶段：平稳期与高峰期（通过在中途插入短暂 sleep 来模拟）。
+func runAdvancedStressTest() {
+	const clientCount = 10000
+	const opsPerClient = 10000
 	var wg sync.WaitGroup
 	start := time.Now()
 
@@ -564,29 +641,106 @@ func runStressTest() {
 			defer conn.Close()
 			reader := bufio.NewReader(conn)
 			for j := 0; j < opsPerClient; j++ {
-				// 构造一个简单的 SET 命令：SET key_<clientID> value_<j>
-				key := fmt.Sprintf("key_%d", clientID)
-				value := fmt.Sprintf("value_%d", j)
-				cmd := fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(value), value)
-				conn.Write([]byte(cmd))
-				// 读取响应
-				_, err := reader.ReadString('\n')
-				if err != nil {
-					log.Printf("Client %d: error reading SET response: %v\n", clientID, err)
+				var key, cmd string
+				// 模拟 80% 热点数据访问和 20% 常规数据访问
+				if j%5 < 4 {
+					// 80% 请求集中访问热点键 "hot_data"
+					key = "hot_data"
+					// 每 50 次操作更新一次热点数据（SET），其余为 GET
+					if j%50 == 0 {
+						cmd = fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$5\r\nvalue\r\n", len(key), key)
+					} else {
+						cmd = fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
+					}
+				} else {
+					// 20% 请求访问随机生成的键
+					key = fmt.Sprintf("key_%d_%d", clientID, j)
+					// 模拟写操作与读操作交替进行
+					if j%10 == 0 {
+						cmd = fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$4\r\nval%d\r\n", len(key), key, j)
+					} else {
+						cmd = fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
+					}
+				}
+				// 发送命令
+				if _, err := conn.Write([]byte(cmd)); err != nil {
+					log.Printf("Client %d: write error: %v\n", clientID, err)
 					return
 				}
-				// 然后执行 GET 命令
-				cmd = fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-				conn.Write([]byte(cmd))
-				_, err = reader.ReadString('\n')
-				if err != nil {
-					log.Printf("Client %d: error reading GET response: %v\n", clientID, err)
+				// 读取响应（只读取第一行响应）
+				if _, err := reader.ReadString('\n'); err != nil {
+					log.Printf("Client %d: read error: %v\n", clientID, err)
 					return
+				}
+
+				// 在达到一半操作数时，模拟高峰期的突发延迟（例如短暂的 sleep）
+				if j == opsPerClient/2 {
+					time.Sleep(100 * time.Millisecond)
 				}
 			}
 		}(i)
 	}
 	wg.Wait()
 	duration := time.Since(start)
-	log.Printf("Stress test completed: %d clients * %d ops in %v\n", clientCount, opsPerClient*2, duration)
+	log.Printf("Advanced stress test completed: %d clients * %d ops in %v\n", clientCount, opsPerClient, duration)
+}
+
+func runLeaderboardTest() {
+    const clientCount = 50
+    const opsPerClient = 500
+    var wg sync.WaitGroup
+    start := time.Now()
+
+    for i := 0; i < clientCount; i++ {
+        wg.Add(1)
+        go func(clientID int) {
+            defer wg.Done()
+            conn, err := net.Dial("tcp", "127.0.0.1:6379")
+            if err != nil {
+                log.Printf("Client %d: connection error: %v\n", clientID, err)
+                return
+            }
+            defer conn.Close()
+            reader := bufio.NewReader(conn)
+
+            for j := 0; j < opsPerClient; j++ {
+                // 模拟更新积分
+                player := fmt.Sprintf("player_%d", (clientID+j)%1000) // 1000 个玩家
+                score := j % 100      // 0~99
+                // LBADD <player> <score>
+                cmd := fmt.Sprintf("*3\r\n$5\r\nLBADD\r\n$%d\r\n%s\r\n$%d\r\n%d\r\n",
+                    len(player), player, len(strconv.Itoa(score)), score)
+                if _, err := conn.Write([]byte(cmd)); err != nil {
+                    log.Printf("Client %d: write LBADD error: %v\n", clientID, err)
+                    return
+                }
+                // 读取响应
+                if _, err := reader.ReadString('\n'); err != nil {
+                    log.Printf("Client %d: read LBADD error: %v\n", clientID, err)
+                    return
+                }
+
+                // 偶尔查询排行榜
+                if j%50 == 0 {
+                    topN := 5
+                    // LBTOP 5
+                    cmd = fmt.Sprintf("*2\r\n$5\r\nLBTOP\r\n$%d\r\n%d\r\n", len(strconv.Itoa(topN)), topN)
+                    if _, err := conn.Write([]byte(cmd)); err != nil {
+                        log.Printf("Client %d: write LBTOP error: %v\n", clientID, err)
+                        return
+                    }
+                    // 读取前几行响应 (忽略具体数据)
+                    if _, err := reader.ReadString('\n'); err != nil {
+                        log.Printf("Client %d: read LBTOP error: %v\n", clientID, err)
+                        return
+                    }
+                }
+            }
+        }(i)
+    }
+
+    wg.Wait()
+    duration := time.Since(start)
+    log.Printf("Leaderboard test completed: %d clients * %d ops in %v\n",
+        clientCount, opsPerClient, duration)
 }
