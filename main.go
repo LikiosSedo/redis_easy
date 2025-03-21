@@ -7,16 +7,17 @@ import (
 	"log"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
-    "sort"
+	"math/rand" // add this import
 )
 
-// 定义数据类型
 type DataType int
 
 const (
@@ -30,7 +31,7 @@ const (
 type Entry struct {
 	Type     DataType
 	Value    interface{}
-	ExpireAt time.Time // 过期时间，零值表示不过期
+	ExpireAt time.Time 
 }
 
 // 判断当前条目是否已过期
@@ -41,24 +42,33 @@ func (e *Entry) isExpired() bool {
 	return time.Now().After(e.ExpireAt)
 }
 
-// 全局缓存，key 为 string，对应的值为 *Entry
 var cache sync.Map
 var leaderboard sync.Map
 
 func main() {
-	// 如果传入 "stress" 参数则启动压力测试
-	if len(os.Args) > 1 && os.Args[1] == "stress" {
-		runAdvancedStressTest()
-		return
+	// 根据命令行参数选择不同的运行模式
+	if len(os.Args) > 1 {
+		if os.Args[1] == "stress" {
+			runAdvancedStressTest()
+			return
+		}
+		if os.Args[1] == "leaderboard" {
+			runLeaderboardTest()
+			return
+		}
 	}
-    if len(os.Args) > 1 && os.Args[1] == "leaderboard" {
-        runLeaderboardTest()
-        return
-    }
-	// 启动 pprof 服务，方便使用 Go 内置工具进行性能分析
+
+	// 启动 pprof 服务，方便性能分析（监听 :6060）
 	go func() {
 		log.Println("pprof server listening on :6060")
 		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
+	// 启动排行榜快照 HTTP 服务（监听 :8080）
+	go func() {
+		http.HandleFunc("/leaderboard", leaderboardSnapshotHandler)
+		log.Println("Snapshot server listening on :8080")
+		log.Fatal(http.ListenAndServe(":8080", nil))
 	}()
 
 	// 启动 TCP 服务监听 6379 端口
@@ -118,17 +128,24 @@ func handleConnection(conn net.Conn) {
 			handleSAdd(conn, request)
 		case "SMEMBERS":
 			handleSMembers(conn, request)
+		case "SREM":
+			handleSRem(conn, request)
 		case "HSET":
 			handleHSet(conn, request)
 		case "HGET":
 			handleHGet(conn, request)
+		case "HDEL":
+			handleHDel(conn, request)
+		case "LBADD":
+			handleLBAdd(conn, request)
+		case "LBTOP":
+			handleLBTop(conn, request)
+		case "LRANGE":
+			handleLRange(conn, request)
 		case "QUIT":
 			conn.Write([]byte("+OK\r\n"))
-        case "LBADD":
-            handleLBAdd(conn, request)
-        case "LBTOP":
-            handleLBTop(conn, request)
 			return
+		
 		default:
 			conn.Write([]byte(fmt.Sprintf("-ERR unknown command '%s'\r\n", request[0])))
 		}
@@ -211,10 +228,6 @@ func readCommand(reader *bufio.Reader) ([]string, error) {
 	}
 }
 
-// ======================
-// 命令实现部分
-// ======================
-
 // GET 命令：返回指定键对应的字符串值
 func handleGet(conn net.Conn, args []string) {
 	if len(args) != 2 {
@@ -228,7 +241,6 @@ func handleGet(conn net.Conn, args []string) {
 		return
 	}
 	entry := val.(*Entry)
-	// 检查是否过期
 	if entry.isExpired() {
 		cache.Delete(key)
 		conn.Write([]byte("$-1\r\n"))
@@ -243,7 +255,6 @@ func handleGet(conn net.Conn, args []string) {
 }
 
 // SET 命令：设置字符串键值，并支持 EX/PX 选项设置过期时间
-// 用法示例：SET key value [EX seconds | PX milliseconds]
 func handleSet(conn net.Conn, args []string) {
 	if len(args) < 3 {
 		conn.Write([]byte("-ERR wrong number of arguments for 'SET' command\r\n"))
@@ -292,7 +303,6 @@ func handleDel(conn net.Conn, args []string) {
 	}
 	count := 0
 	for _, key := range args[1:] {
-		// 若键存在且未过期，则删除之
 		val, ok := cache.Load(key)
 		if ok {
 			entry := val.(*Entry)
@@ -308,7 +318,6 @@ func handleDel(conn net.Conn, args []string) {
 }
 
 // TTL 命令：返回指定键剩余的生存时间（单位秒）
-// 若键不存在返回 -2，若键存在但没有设置过期返回 -1
 func handleTTL(conn net.Conn, args []string) {
 	if len(args) != 2 {
 		conn.Write([]byte("-ERR wrong number of arguments for 'TTL' command\r\n"))
@@ -357,13 +366,12 @@ func handleLPush(conn net.Conn, args []string) {
 			list = entry.Value.([]string)
 		}
 	}
-	// 将新元素插入列表头部
 	newElems := args[2:]
 	list = append(newElems, list...)
 	entry := &Entry{
 		Type:     ListType,
 		Value:    list,
-		ExpireAt: time.Time{}, // 继承原有过期逻辑可在此扩展
+		ExpireAt: time.Time{},
 	}
 	cache.Store(key, entry)
 	conn.Write([]byte(fmt.Sprintf(":%d\r\n", len(list))))
@@ -396,10 +404,8 @@ func handleLPop(conn net.Conn, args []string) {
 		conn.Write([]byte("$-1\r\n"))
 		return
 	}
-	// 弹出第一个元素
 	popped := list[0]
 	list = list[1:]
-	// 更新存储
 	if len(list) == 0 {
 		cache.Delete(key)
 	} else {
@@ -470,7 +476,6 @@ func handleSMembers(conn net.Conn, args []string) {
 		return
 	}
 	set := entry.Value.(map[string]struct{})
-	// 构造 RESP 数组格式返回
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("*%d\r\n", len(set)))
 	for member := range set {
@@ -478,6 +483,50 @@ func handleSMembers(conn net.Conn, args []string) {
 	}
 	conn.Write([]byte(sb.String()))
 }
+// SREM 命令：从集合中删除一个或多个成员，返回删除的成员数量
+func handleSRem(conn net.Conn, args []string) {
+    if len(args) < 3 {
+        conn.Write([]byte("-ERR wrong number of arguments for 'SREM' command\r\n"))
+        return
+    }
+    key := args[1]
+    val, ok := cache.Load(key)
+    if !ok {
+        // 键不存在，直接返回 0
+        conn.Write([]byte(":0\r\n"))
+        return
+    }
+    entry := val.(*Entry)
+    if entry.isExpired() {
+        cache.Delete(key)
+        conn.Write([]byte(":0\r\n"))
+        return
+    }
+    if entry.Type != SetType {
+        conn.Write([]byte("-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n"))
+        return
+    }
+    set := entry.Value.(map[string]struct{})
+    removed := 0
+    // 遍历待删除的每个成员
+    for _, member := range args[2:] {
+        if _, exists := set[member]; exists {
+            delete(set, member)
+            removed++
+        }
+    }
+    // 如果删除后集合为空，可以选择删除整个键
+    if len(set) == 0 {
+        cache.Delete(key)
+    } else {
+        // 更新存储中的集合
+        entry.Value = set
+        cache.Store(key, entry)
+    }
+    // 返回删除的成员数量
+    conn.Write([]byte(fmt.Sprintf(":%d\r\n", removed)))
+}
+
 
 // HSET 命令：设置哈希中指定字段的值，返回新增字段数（更新时返回 0）
 func handleHSet(conn net.Conn, args []string) {
@@ -549,25 +598,145 @@ func handleHGet(conn net.Conn, args []string) {
 	}
 	conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(value), value)))
 }
+// HDEL 命令：删除哈希中一个或多个字段，返回成功删除的字段数
+func handleHDel(conn net.Conn, args []string) {
+    if len(args) < 3 {
+        conn.Write([]byte("-ERR wrong number of arguments for 'HDEL' command\r\n"))
+        return
+    }
+    key := args[1]
+    val, ok := cache.Load(key)
+    if !ok {
+        // 如果 key 不存在，则删除字段数为 0
+        conn.Write([]byte(":0\r\n"))
+        return
+    }
+    entry := val.(*Entry)
+    // 如果 key 已过期，则删除条目并返回 0
+    if entry.isExpired() {
+        cache.Delete(key)
+        conn.Write([]byte(":0\r\n"))
+        return
+    }
+    // 如果类型不是 HashType，则返回错误
+    if entry.Type != HashType {
+        conn.Write([]byte("-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n"))
+        return
+    }
+    hash := entry.Value.(map[string]string)
 
+    // 统计成功删除的字段数
+    deletedCount := 0
+    for _, field := range args[2:] {
+        if _, exists := hash[field]; exists {
+            delete(hash, field)
+            deletedCount++
+        }
+    }
+
+    // 如果删完后 hash 为空，可选择删除整个 key
+    if len(hash) == 0 {
+        cache.Delete(key)
+    } else {
+        entry.Value = hash
+        cache.Store(key, entry)
+    }
+    conn.Write([]byte(fmt.Sprintf(":%d\r\n", deletedCount)))
+}
+
+// LRANGE 命令：返回列表中从 start 到 stop 范围内的元素（stop 为闭区间）
+func handleLRange(conn net.Conn, args []string) {
+    if len(args) != 4 {
+        conn.Write([]byte("-ERR wrong number of arguments for 'LRANGE' command\r\n"))
+        return
+    }
+    key := args[1]
+    startIdx, err1 := strconv.Atoi(args[2])
+    stopIdx, err2 := strconv.Atoi(args[3])
+    if err1 != nil || err2 != nil {
+        conn.Write([]byte("-ERR value is not an integer or out of range\r\n"))
+        return
+    }
+    // 获取列表数据
+    val, ok := cache.Load(key)
+    if !ok {
+        conn.Write([]byte("*0\r\n"))
+        return
+    }
+    entry := val.(*Entry)
+    if entry.isExpired() {
+        cache.Delete(key)
+        conn.Write([]byte("*0\r\n"))
+        return
+    }
+    if entry.Type != ListType {
+        conn.Write([]byte("-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n"))
+        return
+    }
+    list := entry.Value.([]string)
+    n := len(list)
+
+    // 处理负索引：如果 start 或 stop 为负值，则从列表尾部计算偏移
+    if startIdx < 0 {
+        startIdx = n + startIdx
+    }
+    if stopIdx < 0 {
+        stopIdx = n + stopIdx
+    }
+    // 修正起始和结束索引的边界
+    if startIdx < 0 {
+        startIdx = 0
+    }
+    if stopIdx < 0 {
+        stopIdx = 0
+    }
+    if startIdx > n-1 {
+        conn.Write([]byte("*0\r\n"))
+        return
+    }
+    if stopIdx > n-1 {
+        stopIdx = n - 1
+    }
+    if startIdx > stopIdx {
+        conn.Write([]byte("*0\r\n"))
+        return
+    }
+    sublist := list[startIdx : stopIdx+1]
+
+    // 按 RESP 协议格式构造返回结果
+    var sb strings.Builder
+    sb.WriteString(fmt.Sprintf("*%d\r\n", len(sublist)))
+    for _, item := range sublist {
+        sb.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(item), item))
+    }
+    conn.Write([]byte(sb.String()))
+}
+
+
+// LBADD 命令：更新或插入用户分数到排行榜
 func handleLBAdd(conn net.Conn, args []string) {
     if len(args) != 3 {
         conn.Write([]byte("-ERR wrong number of arguments for 'LBADD' command\r\n"))
         return
     }
     user := args[1]
-    scoreStr := args[2]
-    score, err := strconv.Atoi(scoreStr)
+    score, err := strconv.Atoi(args[2])
     if err != nil {
         conn.Write([]byte("-ERR score must be an integer\r\n"))
         return
     }
-
-    // 更新或插入用户分数
+    // 限制分数范围在 [0, 10000]
+    if score > 10000 {
+        score = 10000
+    } else if score < 0 {
+        score = 0
+    }
     leaderboard.Store(user, score)
     conn.Write([]byte("+OK\r\n"))
 }
 
+
+// LBTOP 命令：返回排行榜前 N 名（返回 RESP 格式）
 func handleLBTop(conn net.Conn, args []string) {
     if len(args) != 2 {
         conn.Write([]byte("-ERR wrong number of arguments for 'LBTOP' command\r\n"))
@@ -578,33 +747,27 @@ func handleLBTop(conn net.Conn, args []string) {
         conn.Write([]byte("-ERR N must be a positive integer\r\n"))
         return
     }
-
-    // 收集所有 (user, score)
     var data []struct {
         User  string
         Score int
     }
     leaderboard.Range(func(key, value interface{}) bool {
-        user := key.(string)
-        score := value.(int)
         data = append(data, struct {
             User  string
             Score int
-        }{user, score})
+        }{key.(string), value.(int)})
         return true
     })
-
-    // 按 score 降序排序
+    // 按分数降序排序，如分数相同则按用户名升序
     sort.Slice(data, func(i, j int) bool {
+        if data[i].Score == data[j].Score {
+            return data[i].User < data[j].User
+        }
         return data[i].Score > data[j].Score
     })
-
-    // 构造 RESP 返回
     if topN > len(data) {
         topN = len(data)
     }
-    // 返回形式：*<N*2>\r\n (因为要返回用户名和分数两个字段)
-    // 再用 bulk string 方式输出
     var sb strings.Builder
     sb.WriteString(fmt.Sprintf("*%d\r\n", topN*2))
     for i := 0; i < topN; i++ {
@@ -616,19 +779,177 @@ func handleLBTop(conn net.Conn, args []string) {
     conn.Write([]byte(sb.String()))
 }
 
-// ======================
-// 简单的压力测试代码
-// ======================
 
-// runStressTest 模拟多个客户端并发发送 SET/GET 命令
-// runAdvancedStressTest 模拟缓存服务场景下的高并发读写：80% 请求热点数据、20% 请求随机数据。
-// 此测试分为两个阶段：平稳期与高峰期（通过在中途插入短暂 sleep 来模拟）。
+// HTTP handler: 实时生成排行榜快照页面，显示 Top20，并每 0.2s 自动刷新一次
+func leaderboardSnapshotHandler(w http.ResponseWriter, r *http.Request) {
+	var data []struct {
+		User  string
+		Score int
+	}
+	leaderboard.Range(func(key, value interface{}) bool {
+		data = append(data, struct {
+			User  string
+			Score int
+		}{key.(string), value.(int)})
+		return true
+	})
+	sort.Slice(data, func(i, j int) bool {
+		return data[i].Score > data[j].Score
+	})
+	topN := 20
+	if len(data) < topN {
+		topN = len(data)
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<html>
+<head>
+<meta http-equiv="refresh" content="0.2">
+<title>Leaderboard Snapshot</title>
+<style>
+table { border-collapse: collapse; width: 50%%; }
+th, td { border: 1px solid #ccc; padding: 8px; text-align: center; }
+</style>
+</head>
+<body>
+<h2>Leaderboard Snapshot (Top %d)</h2>
+<table>
+<tr><th>Rank</th><th>User</th><th>Score</th></tr>`, topN)
+	for i := 0; i < topN; i++ {
+		fmt.Fprintf(w, "<tr><td>%d</td><td>%s</td><td>%d</td></tr>", i+1, data[i].User, data[i].Score)
+	}
+	fmt.Fprint(w, `</table>
+</body>
+</html>`)
+}
+
+// runAdvancedStressTest 模拟缓存服务场景下的高并发读写：80% 请求热点数据、20% 请求随机数据
 func runAdvancedStressTest() {
-	const clientCount = 10000
+    // 调整并发连接数，减少对系统资源的瞬时冲击
+    const clientCount = 1000
+    const opsPerClient = 10000
+    var wg sync.WaitGroup
+    var totalOps int64   // 总操作数计数器
+    var successOps int64 // 成功响应数计数器
+
+    start := time.Now()
+
+    for i := 0; i < clientCount; i++ {
+        wg.Add(1)
+        go func(clientID int) {
+            defer wg.Done()
+
+            // 初始建立连接，最多尝试 3 次
+            const maxInitialRetries = 3
+            var conn net.Conn
+            var err error
+            for r := 0; r < maxInitialRetries; r++ {
+                conn, err = net.Dial("tcp", "127.0.0.1:6379")
+                if err == nil {
+                    break
+                }
+                log.Printf("Client %d: initial dial attempt %d error: %v\n", clientID, r+1, err)
+                time.Sleep(50 * time.Millisecond)
+            }
+            if conn == nil {
+                log.Printf("Client %d: failed to establish initial connection after %d attempts\n", clientID, maxInitialRetries)
+                return
+            }
+            reader := bufio.NewReader(conn)
+
+            for j := 0; j < opsPerClient; j++ {
+                var key, cmd string
+                if j%5 < 4 {
+                    key = "hot_data"
+                    if j%50 == 0 {
+                        cmd = fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$5\r\nvalue\r\n", len(key), key)
+                    } else {
+                        cmd = fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
+                    }
+                } else {
+                    key = fmt.Sprintf("key_%d_%d", clientID, j)
+                    if j%10 == 0 {
+                        cmd = fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$4\r\nval%d\r\n", len(key), key, j)
+                    } else {
+                        cmd = fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
+                    }
+                }
+
+                const maxRetries = 3
+                var opErr error
+                var resp string
+
+                // 每个操作最多尝试 maxRetries 次
+                for attempt := 0; attempt < maxRetries; attempt++ {
+                    // 如果连接为 nil，则尝试重新建立连接
+                    if conn == nil {
+                        conn, err = net.Dial("tcp", "127.0.0.1:6379")
+                        if err != nil {
+                            log.Printf("Client %d: re-dial error (attempt %d): %v\n", clientID, attempt+1, err)
+                            time.Sleep(50 * time.Millisecond)
+                            continue
+                        }
+                        reader = bufio.NewReader(conn)
+                    }
+
+                    // 发送命令
+                    _, err = conn.Write([]byte(cmd))
+                    if err != nil {
+                        log.Printf("Client %d: write error (attempt %d): %v\n", clientID, attempt+1, err)
+                        opErr = err
+                        conn.Close()
+                        conn = nil
+                        time.Sleep(50 * time.Millisecond)
+                        continue
+                    }
+
+                    // 记录本次操作
+                    atomic.AddInt64(&totalOps, 1)
+                    // 读取响应
+                    resp, err = reader.ReadString('\n')
+                    if err != nil {
+                        log.Printf("Client %d: read error (attempt %d): %v\n", clientID, attempt+1, err)
+                        opErr = err
+                        conn.Close()
+                        conn = nil
+                        time.Sleep(50 * time.Millisecond)
+                        continue
+                    }
+                    opErr = nil
+                    break
+                }
+                if opErr == nil && len(resp) > 0 && resp[0] != '-' {
+                    atomic.AddInt64(&successOps, 1)
+                }
+                // 中途暂停一下，模拟真实场景
+                if j == opsPerClient/2 {
+                    time.Sleep(100 * time.Millisecond)
+                }
+            }
+            if conn != nil {
+                conn.Close()
+            }
+        }(i)
+    }
+    wg.Wait()
+    duration := time.Since(start)
+    total := atomic.LoadInt64(&totalOps)
+    success := atomic.LoadInt64(&successOps)
+    successRatio := float64(success) / float64(total) * 100
+
+    log.Printf("Advanced stress test completed: %d clients * %d ops in %v\n", clientCount, opsPerClient, duration)
+    log.Printf("Total operations: %d, Successful responses: %d, Success ratio: %.2f%%\n", total, success, successRatio)
+}
+
+
+func runLeaderboardTest() {
+	const clientCount = 100
 	const opsPerClient = 10000
 	var wg sync.WaitGroup
+
 	start := time.Now()
 
+	// Seed the random number generator
+	rand.Seed(time.Now().UnixNano())
 	for i := 0; i < clientCount; i++ {
 		wg.Add(1)
 		go func(clientID int) {
@@ -641,106 +962,34 @@ func runAdvancedStressTest() {
 			defer conn.Close()
 			reader := bufio.NewReader(conn)
 			for j := 0; j < opsPerClient; j++ {
-				var key, cmd string
-				// 模拟 80% 热点数据访问和 20% 常规数据访问
-				if j%5 < 4 {
-					// 80% 请求集中访问热点键 "hot_data"
-					key = "hot_data"
-					// 每 50 次操作更新一次热点数据（SET），其余为 GET
-					if j%50 == 0 {
-						cmd = fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$5\r\nvalue\r\n", len(key), key)
-					} else {
-						cmd = fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-					}
-				} else {
-					// 20% 请求访问随机生成的键
-					key = fmt.Sprintf("key_%d_%d", clientID, j)
-					// 模拟写操作与读操作交替进行
-					if j%10 == 0 {
-						cmd = fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$4\r\nval%d\r\n", len(key), key, j)
-					} else {
-						cmd = fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-					}
-				}
-				// 发送命令
+				player := fmt.Sprintf("player_%d", (clientID+j)%1000)
+				score := rand.Intn(10001)
+				cmd := fmt.Sprintf("*3\r\n$5\r\nLBADD\r\n$%d\r\n%s\r\n$%d\r\n%d\r\n",
+					len(player), player, len(strconv.Itoa(score)), score)
 				if _, err := conn.Write([]byte(cmd)); err != nil {
-					log.Printf("Client %d: write error: %v\n", clientID, err)
+					log.Printf("Client %d: write LBADD error: %v\n", clientID, err)
 					return
 				}
-				// 读取响应（只读取第一行响应）
 				if _, err := reader.ReadString('\n'); err != nil {
-					log.Printf("Client %d: read error: %v\n", clientID, err)
+					log.Printf("Client %d: read LBADD error: %v\n", clientID, err)
 					return
 				}
-
-				// 在达到一半操作数时，模拟高峰期的突发延迟（例如短暂的 sleep）
-				if j == opsPerClient/2 {
-					time.Sleep(100 * time.Millisecond)
+				if j%50 == 0 {
+					topN := 5
+					cmd = fmt.Sprintf("*2\r\n$5\r\nLBTOP\r\n$%d\r\n%d\r\n", len(strconv.Itoa(topN)), topN)
+					if _, err := conn.Write([]byte(cmd)); err != nil {
+						log.Printf("Client %d: write LBTOP error: %v\n", clientID, err)
+						return
+					}
+					if _, err := reader.ReadString('\n'); err != nil {
+						log.Printf("Client %d: read LBTOP error: %v\n", clientID, err)
+						return
+					}
 				}
 			}
 		}(i)
 	}
 	wg.Wait()
 	duration := time.Since(start)
-	log.Printf("Advanced stress test completed: %d clients * %d ops in %v\n", clientCount, opsPerClient, duration)
-}
-
-func runLeaderboardTest() {
-    const clientCount = 50
-    const opsPerClient = 500
-    var wg sync.WaitGroup
-    start := time.Now()
-
-    for i := 0; i < clientCount; i++ {
-        wg.Add(1)
-        go func(clientID int) {
-            defer wg.Done()
-            conn, err := net.Dial("tcp", "127.0.0.1:6379")
-            if err != nil {
-                log.Printf("Client %d: connection error: %v\n", clientID, err)
-                return
-            }
-            defer conn.Close()
-            reader := bufio.NewReader(conn)
-
-            for j := 0; j < opsPerClient; j++ {
-                // 模拟更新积分
-                player := fmt.Sprintf("player_%d", (clientID+j)%1000) // 1000 个玩家
-                score := j % 100      // 0~99
-                // LBADD <player> <score>
-                cmd := fmt.Sprintf("*3\r\n$5\r\nLBADD\r\n$%d\r\n%s\r\n$%d\r\n%d\r\n",
-                    len(player), player, len(strconv.Itoa(score)), score)
-                if _, err := conn.Write([]byte(cmd)); err != nil {
-                    log.Printf("Client %d: write LBADD error: %v\n", clientID, err)
-                    return
-                }
-                // 读取响应
-                if _, err := reader.ReadString('\n'); err != nil {
-                    log.Printf("Client %d: read LBADD error: %v\n", clientID, err)
-                    return
-                }
-
-                // 偶尔查询排行榜
-                if j%50 == 0 {
-                    topN := 5
-                    // LBTOP 5
-                    cmd = fmt.Sprintf("*2\r\n$5\r\nLBTOP\r\n$%d\r\n%d\r\n", len(strconv.Itoa(topN)), topN)
-                    if _, err := conn.Write([]byte(cmd)); err != nil {
-                        log.Printf("Client %d: write LBTOP error: %v\n", clientID, err)
-                        return
-                    }
-                    // 读取前几行响应 (忽略具体数据)
-                    if _, err := reader.ReadString('\n'); err != nil {
-                        log.Printf("Client %d: read LBTOP error: %v\n", clientID, err)
-                        return
-                    }
-                }
-            }
-        }(i)
-    }
-
-    wg.Wait()
-    duration := time.Since(start)
-    log.Printf("Leaderboard test completed: %d clients * %d ops in %v\n",
-        clientCount, opsPerClient, duration)
+	log.Printf("Leaderboard test completed: %d clients * %d ops in %v\n", clientCount, opsPerClient, duration)
 }
